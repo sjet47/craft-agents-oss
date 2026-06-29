@@ -1630,6 +1630,44 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                             onOpenUrl={onOpenUrl}
                             sessionId={session?.id}
                             compactMode={compactMode}
+                            onEdit={session?.supportsBranching ? async () => {
+                              if (!session) return
+                              // "Edit" reuses the branch primitive: fork from the
+                              // message BEFORE this one (a hard context cutoff that
+                              // excludes this turn), then pre-fill the new session's
+                              // input with the original text so the user can edit &
+                              // resend. Earlier history is immutable, so finding the
+                              // anchor from a slightly-stale closure is safe.
+                              const msgs = session.messages ?? []
+                              const idx = msgs.findIndex(m => m.id === turn.message.id)
+                              const prevId = idx > 0 ? msgs[idx - 1]?.id : undefined
+                              try {
+                                const child = await appShellContext.onCreateSession(
+                                  session.workspaceId,
+                                  {
+                                    ...(prevId
+                                      ? { branchFromMessageId: prevId, branchFromSessionId: session.id }
+                                      : {}),
+                                    name: `Branch of ${session.name || 'Untitled'}`,
+                                    // Inherit parent settings so the branch stays on the same backend/provider.
+                                    llmConnection: session.llmConnection,
+                                    model: session.model,
+                                    permissionMode: session.permissionMode,
+                                    workingDirectory: session.workingDirectory,
+                                    enabledSourceSlugs: session.enabledSourceSlugs,
+                                  }
+                                )
+                                appShellContext.onInputChange(child.id, turn.message.content)
+                                navigate(routes.view.allSessions(child.id), { newPanel: false })
+                              } catch (error) {
+                                const rawMessage = error instanceof Error ? error.message : 'Failed to edit message'
+                                const message = rawMessage.includes('source and target providers must match')
+                                  || rawMessage.includes('same provider/backend')
+                                  ? 'Branching is only supported within the same provider/backend. Switch this panel connection and try again.'
+                                  : rawMessage
+                                toast.error(t('toast.couldNotCreateBranch'), { description: message })
+                              }
+                            } : undefined}
                           />
                         </div>
                       )
@@ -2140,6 +2178,9 @@ interface MessageBubbleProps {
   compactMode?: boolean
   /** Callback to resend the user message that preceded an error */
   onRetry?: () => void
+  /** Callback to edit a user message (branches from the prior point with the
+   *  original text pre-filled). Only wired for user messages. */
+  onEdit?: () => void
 }
 
 /**
@@ -2227,6 +2268,7 @@ function MessageBubble({
   onPopOut,
   compactMode,
   onRetry,
+  onEdit,
 }: MessageBubbleProps) {
   const { t } = useTranslation()
 
@@ -2242,6 +2284,7 @@ function MessageBubble({
         onUrlClick={onOpenUrl}
         onFileClick={onOpenFile}
         compactMode={compactMode}
+        onEdit={onEdit}
       />
     )
   }

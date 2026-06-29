@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Clock } from 'lucide-react'
+import { Clock, Copy, Check, Pencil } from 'lucide-react'
 import type { StoredAttachment, ContentBadge } from '@craft-agent/core'
 import { normalizePath } from '@craft-agent/core/utils'
 import { cn } from '../../lib/utils'
@@ -321,6 +321,9 @@ export interface UserMessageBubbleProps {
   isQueued?: boolean
   /** Compact mode - reduces padding for popover embedding */
   compactMode?: boolean
+  /** When provided, an "edit" action button is shown on hover. The consumer
+   *  decides the semantics (e.g. refill the input / branch from this message). */
+  onEdit?: () => void
 }
 
 /** Minimum visible duration of the "Queued" chip. Both backends ack
@@ -338,9 +341,14 @@ export function UserMessageBubble({
   badges,
   isQueued,
   compactMode,
+  onEdit,
 }: UserMessageBubbleProps) {
   const { t } = useTranslation()
   const hasAttachments = attachments && attachments.length > 0
+
+  // Transient "copied" feedback for the copy action button.
+  const [copied, setCopied] = useState(false)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Show the queued chip while `isQueued` is true AND for at least
   // QUEUED_MIN_VISIBLE_MS after it first became true — even if the backend
@@ -353,6 +361,7 @@ export function UserMessageBubble({
   useEffect(() => {
     return () => {
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
     }
   }, [])
 
@@ -409,8 +418,24 @@ export function UserMessageBubble({
     displayContent = displayContent.trim()
   }
 
+  // Copy the human-visible text (edit_request metadata already stripped above).
+  const handleCopy = () => {
+    void navigator.clipboard?.writeText(displayContent)
+    setCopied(true)
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = setTimeout(() => setCopied(false), 1500)
+  }
+
+  // Hover action row (copy, optional edit). Hidden in compact/popover embedding.
+  const showActions = !compactMode
+  const actionButtonClass = cn(
+    "p-1 rounded-[6px] text-muted-foreground/60 transition-colors",
+    "hover:text-foreground hover:bg-foreground/5",
+    "focus:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+  )
+
   return (
-    <div className={cn("flex flex-col items-end gap-3 w-full", className)}>
+    <div className={cn("group flex flex-col items-end gap-3 w-full", className)}>
       {/* Attachment preview row - stored attachments with thumbnails */}
       {hasAttachments && (
         <div className="flex gap-2 justify-end max-w-[80%] flex-wrap">
@@ -514,6 +539,34 @@ export function UserMessageBubble({
           )
         }
       </div>
+
+      {/* Hover action row — appears on message hover, right-aligned under the
+          bubble. Copy is always available; edit is shown only when the consumer
+          wires an onEdit handler. */}
+      {showActions && (
+        <div className="flex items-center gap-0.5 -mt-1.5 pr-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+          <button
+            type="button"
+            onClick={handleCopy}
+            title={copied ? t('chat.messageCopied') : t('chat.copyMessage')}
+            aria-label={t('chat.copyMessage')}
+            className={actionButtonClass}
+          >
+            {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          </button>
+          {onEdit && (
+            <button
+              type="button"
+              onClick={onEdit}
+              title={t('chat.editMessage')}
+              aria-label={t('chat.editMessage')}
+              className={actionButtonClass}
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   )
 }
