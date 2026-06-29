@@ -23,6 +23,13 @@ export interface DiffViewerPreferences {
   disableBackground?: boolean;
 }
 
+// Re-export the Agent Context default paths (defined in a node-free leaf module
+// so the renderer can import them without bundling `fs`/`path`).
+export {
+  DEFAULT_AGENT_CONTEXT_GLOBAL_PATH,
+  DEFAULT_AGENT_CONTEXT_PROJECT_PATH,
+} from './agent-context-defaults.ts';
+
 export interface UserPreferences {
   name?: string;
   timezone?: string;
@@ -33,6 +40,17 @@ export interface UserPreferences {
   diffViewer?: DiffViewerPreferences;
   // Whether to include Co-Authored-By trailer on git commits (default: true)
   includeCoAuthoredBy?: boolean;
+  // Agent Context — auto-inject context files into the system prompt.
+  // `undefined` enabled is treated as TRUE (default-on); empty/undefined path
+  // falls back to the DEFAULT_AGENT_CONTEXT_* constants above.
+  /** Whether the global agent context file is injected (default: true) */
+  agentContextGlobalEnabled?: boolean;
+  /** Path to the global agent context file (supports ~/$HOME) */
+  agentContextGlobalPath?: string;
+  /** Whether the per-project agent context file is injected (default: true) */
+  agentContextProjectEnabled?: boolean;
+  /** Path to the project agent context file (relative to working directory) */
+  agentContextProjectPath?: string;
   /**
    * Internal: persisted UI language code (mirrors Appearance → Language).
    * Maintained only by the main-process `i18n:changeLanguage` IPC handler.

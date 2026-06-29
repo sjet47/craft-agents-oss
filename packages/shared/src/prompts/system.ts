@@ -1,6 +1,13 @@
-import { formatPreferencesForPrompt, getCoAuthorPreference } from '../config/preferences.ts';
+import {
+  formatPreferencesForPrompt,
+  getCoAuthorPreference,
+  loadPreferences,
+  DEFAULT_AGENT_CONTEXT_GLOBAL_PATH,
+  DEFAULT_AGENT_CONTEXT_PROJECT_PATH,
+} from '../config/preferences.ts';
 import { getBrowserToolEnabled } from '../config/storage.ts';
 import { debug } from '../utils/debug.ts';
+import { expandPath } from '../utils/paths.ts';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join, relative, basename } from 'path';
 import { DOC_REFS, APP_ROOT } from '../docs/index.ts';
@@ -180,6 +187,101 @@ export function readProjectContextFile(directory: string): { filename: string; c
 }
 
 /**
+ * Read a context file with the standard 10KB cap + truncation marker.
+ * Mirrors the truncation behaviour of readProjectContextFile().
+ * Returns the (possibly truncated) content, or null if the file can't be read.
+ */
+function readCappedContextFile(filePath: string): string | null {
+  try {
+    const content = readFileSync(filePath, 'utf-8');
+    if (content.length > MAX_CONTEXT_FILE_SIZE) {
+      debug(`[readCappedContextFile] ${filePath} exceeds max size, truncating`);
+      return content.slice(0, MAX_CONTEXT_FILE_SIZE) + '\n\n... (truncated)';
+    }
+    return content;
+  } catch (error) {
+    debug(`[readCappedContextFile] Error reading ${filePath}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Resolve the per-project agent-context file that getAgentContextPrompt injects.
+ *
+ * Returns the absolute path when project injection is enabled (default on), a
+ * working directory is present, and the resolved file exists — otherwise null.
+ * Shared by getAgentContextPrompt (to inject content) and
+ * getProjectContextFilesPrompt (to suppress the now-redundant root listing).
+ */
+function getInjectedProjectContextPath(workingDirectory?: string): string | null {
+  if (!workingDirectory) return null;
+  const prefs = loadPreferences();
+  // Default-on: only an explicit `false` disables injection.
+  if (prefs.agentContextProjectEnabled === false) return null;
+  const projectPath = prefs.agentContextProjectPath || DEFAULT_AGENT_CONTEXT_PROJECT_PATH;
+  const resolved = expandPath(projectPath, workingDirectory);
+  return existsSync(resolved) ? resolved : null;
+}
+
+/**
+ * Build the agent-context injection block(s) for the system prompt.
+ *
+ * Injects the CONTENT of the configured global and project context files
+ * directly into the prompt — restoring reliable default context the way
+ * Claude Code / Codex treat CLAUDE.md / AGENTS.md, instead of merely listing
+ * filenames. Preferences are read synchronously (mirrors
+ * formatPreferencesForPrompt).
+ *
+ * - GLOBAL block (default on): authoritative context across all projects.
+ * - PROJECT block (default on): authoritative context for the current project;
+ *   overrides global. Requires a working directory.
+ *
+ * Order: global first, project second (project overrides global). Each file is
+ * read with the standard 10KB cap. Returns '' when nothing is injected.
+ */
+export function getAgentContextPrompt(workingDirectory?: string): string {
+  const prefs = loadPreferences();
+  const blocks: string[] = [];
+
+  // GLOBAL — default on; only an explicit `false` disables it.
+  if (prefs.agentContextGlobalEnabled !== false) {
+    const globalPath = prefs.agentContextGlobalPath || DEFAULT_AGENT_CONTEXT_GLOBAL_PATH;
+    const resolved = expandPath(globalPath);
+    if (existsSync(resolved)) {
+      const content = readCappedContextFile(resolved);
+      if (content !== null) {
+        blocks.push(
+          `The following is authoritative global context that applies across all projects; follow it unless overridden by more specific project context or the user.
+<global_agent_context path="${resolved}">
+${content}
+</global_agent_context>`
+        );
+      }
+    }
+  }
+
+  // PROJECT — default on; requires a working directory and an existing file.
+  const projectFile = getInjectedProjectContextPath(workingDirectory);
+  if (projectFile) {
+    const content = readCappedContextFile(projectFile);
+    if (content !== null) {
+      blocks.push(
+        `The following is authoritative default context for THIS project; it overrides global context.
+<project_context file="${projectFile}" working_directory="${workingDirectory}">
+${content}
+</project_context>`
+      );
+    }
+  }
+
+  if (blocks.length === 0) {
+    return '';
+  }
+
+  return '\n' + blocks.join('\n\n');
+}
+
+/**
  * Get the working directory context string for injection into user messages.
  * Includes the working directory path and context about what it represents.
  * Returns empty string if no working directory is set.
@@ -268,8 +370,21 @@ export function getProjectContextFilesPrompt(workingDirectory?: string): string 
     return '';
   }
 
+  // When getAgentContextPrompt has already injected the project-root context
+  // file, drop root files from this LISTING so the model isn't told to read a
+  // file whose content is already in the prompt. Nested (package) files are
+  // still listed for on-demand reading. Falls back to listing everything when
+  // nothing was injected (project injection disabled or no root file present).
+  const injectedProjectFile = getInjectedProjectContextPath(workingDirectory);
+  const filesToList = injectedProjectFile
+    ? contextFiles.filter((file) => file.includes('/'))
+    : contextFiles;
+  if (filesToList.length === 0) {
+    return '';
+  }
+
   // Format file list with (root) annotation for top-level files
-  const fileList = contextFiles
+  const fileList = filesToList
     .map((file) => {
       const isRoot = !file.includes('/');
       return `- ${file}${isRoot ? ' (root)' : ''}`;
@@ -362,6 +477,11 @@ export function getSystemPrompt(
   const preferences = pinnedPreferencesPrompt ?? formatPreferencesForPrompt();
   const debugContext = debugMode?.enabled ? formatDebugModeContext(debugMode.logFilePath) : '';
 
+  // Inject configured global/project agent-context file CONTENT directly into the
+  // system prompt (default-on; see getAgentContextPrompt). Placed before the
+  // nested context-file listing below.
+  const agentContext = getAgentContextPrompt(workingDirectory);
+
   // Get project context files for monorepo support (lives in system prompt for persistence across compaction)
   const projectContextFiles = getProjectContextFilesPrompt(workingDirectory);
 
@@ -373,7 +493,7 @@ export function getSystemPrompt(
   // to enable prompt caching. The system prompt stays static and cacheable.
   // Safe Mode context is also in user messages for the same reason.
   const basePrompt = getCraftAssistantPrompt(workspaceRootPath, backendName, resolvedIncludeCoAuthoredBy);
-  const fullPrompt = `${basePrompt}${preferences}${debugContext}${projectContextFiles}`;
+  const fullPrompt = `${basePrompt}${preferences}${debugContext}${agentContext}${projectContextFiles}`;
 
   debug('[getSystemPrompt] full prompt length:', fullPrompt.length);
 
@@ -563,9 +683,13 @@ Skills are stored at three levels (checked in order):
 
 ## Project Context
 
-When \`<project_context_files>\` appears in the system prompt, it lists all discovered context files (CLAUDE.md, AGENTS.md) in the working directory and its subdirectories. This supports monorepos where each package may have its own context file.
+Default context files are injected directly into this system prompt as their full content:
+- \`<global_agent_context>\` — authoritative context that applies across all projects.
+- \`<project_context>\` — authoritative context for the current project; it overrides global context.
 
-Read relevant context files using the Read tool - they contain architecture info, conventions, and project-specific guidance. For monorepos, read the root context file first, then package-specific files as needed based on what you're working on.
+When these blocks are present, treat their content as already-loaded guidance — you do not need to re-read those files.
+
+When \`<project_context_files>\` appears, it lists additional (nested) context files (CLAUDE.md, AGENTS.md) found in the working directory's subdirectories. This supports monorepos where each package may have its own context file. Read these on demand using the Read tool based on what you're working on — they contain architecture info, conventions, and project-specific guidance.
 
 ## Configuration Documentation
 
