@@ -46,6 +46,20 @@ import {
  */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
+/**
+ * Emoji reaction used as a lightweight "received — working on it" acknowledgement
+ * on the user's message, in place of a text ack. `StatusFlashOfInspiration` (💡)
+ * is a valid Feishu reaction `emoji_type` (see im-v1 message-reaction docs).
+ */
+const ACK_REACTION_EMOJI = 'StatusFlashOfInspiration'
+
+/**
+ * TTL for the inbound-event dedup cache. Feishu's long connection delivers
+ * events AT-LEAST-ONCE — it redelivers when an ack is slow or the socket
+ * reconnects — so we drop any event_id seen again within this window.
+ */
+const EVENT_DEDUP_TTL_MS = 10 * 60 * 1000
+
 const NOOP_LOGGER: MessagingLogger = {
   info: () => {},
   warn: () => {},
@@ -137,6 +151,18 @@ interface LarkClient {
         path: { message_id: string }
         data: { content: string }
       }) => Promise<unknown>
+      get: (args: {
+        path: { message_id: string }
+      }) => Promise<{ data?: { items?: Array<{ chat_id?: string }> } } | null>
+    }
+    messageReaction: {
+      create: (args: {
+        path: { message_id: string }
+        data: { reaction_type: { emoji_type: string } }
+      }) => Promise<{ data?: { reaction_id?: string } } | null>
+      delete: (args: {
+        path: { message_id: string; reaction_id: string }
+      }) => Promise<unknown>
     }
     file: {
       create: (args: {
@@ -158,8 +184,12 @@ interface LarkClient {
  * outer `.event` accessor.
  */
 interface LarkMessageEvent {
+  /** Header field, flattened to top level by the SDK; used for dedup. */
+  event_id?: string
   sender: {
     sender_id?: { user_id?: string; open_id?: string; union_id?: string }
+    /** 'user' | 'app' — 'app' means a bot/app sent it; used to drop bot traffic. */
+    sender_type?: string
   }
   message: {
     message_id: string
@@ -170,6 +200,22 @@ interface LarkMessageEvent {
     create_time: string
     mentions?: Array<{ key: string; id: { user_id?: string }; name: string }>
   }
+}
+
+/**
+ * Flattened `im.message.reaction.created_v1` payload — fires when someone adds
+ * an emoji reaction to a message in a chat the bot is in. Carries the target
+ * `message_id` and the emoji, NOT any new message text. Note there is no
+ * `chat_id`, so routing requires a `im.message.get` lookup.
+ */
+interface LarkReactionEvent {
+  event_id?: string
+  message_id?: string
+  reaction_type?: { emoji_type?: string }
+  /** 'user' | 'app' — our own ack reactions come back as 'app'; skip those. */
+  operator_type?: string
+  user_id?: { user_id?: string; open_id?: string; union_id?: string }
+  action_time?: string
 }
 
 /**
@@ -216,6 +262,35 @@ export class LarkAdapter implements PlatformAdapter {
    * requires the new `msg_type` to match the original.
    */
   private sentMsgTypes = new Map<string, 'text' | 'post' | 'interactive'>()
+
+  /**
+   * Recently-seen Feishu event ids, for idempotency. Feishu's long connection
+   * delivers events AT-LEAST-ONCE (it redelivers when an ack is slow or the
+   * socket reconnects); without this guard a single user message gets processed
+   * multiple times — the duplicate-message / duplicate-command bug. Values are
+   * insertion timestamps; stale entries are evicted opportunistically.
+   */
+  private seenEventIds = new Map<string, number>()
+
+  /**
+   * True if this event was already seen within the TTL (i.e. a redelivery).
+   * Records unseen ids. Falls back to `fallbackKey` when no event_id is present.
+   */
+  private isDuplicateEvent(eventId: string | undefined, fallbackKey: string | undefined): boolean {
+    const key = eventId || fallbackKey
+    if (!key) return false
+    const now = Date.now()
+    // Opportunistic eviction so the map can't grow unbounded.
+    if (this.seenEventIds.size > 500) {
+      for (const [k, ts] of this.seenEventIds) {
+        if (now - ts > EVENT_DEDUP_TTL_MS) this.seenEventIds.delete(k)
+      }
+    }
+    const prev = this.seenEventIds.get(key)
+    if (prev !== undefined && now - prev < EVENT_DEDUP_TTL_MS) return true
+    this.seenEventIds.set(key, now)
+    return false
+  }
 
   /** Fetch bot profile for UI hints. */
   async getBotInfo(): Promise<{ name?: string } | null> {
@@ -279,8 +354,40 @@ export class LarkAdapter implements PlatformAdapter {
     // names. Cast the handler block once via `unknown` to keep the adapter
     // readable; the per-handler payload casts above handle the actual shape.
     const eventDispatcher = new lark.EventDispatcher({}).register({
-      'im.message.receive_v1': async (data: unknown) => {
-        await this.handleIncomingMessage(data as LarkMessageEvent)
+      // Fire-and-forget: return immediately so the SDK acks Feishu right away.
+      // Awaiting the full agent turn here delays the ack past Feishu's window,
+      // which triggers at-least-once REDELIVERY (duplicate messages). Fast ack
+      // + event_id dedup together stop that.
+      'im.message.receive_v1': (data: unknown) => {
+        const evt = data as LarkMessageEvent
+        if (this.isDuplicateEvent(evt.event_id, evt.message?.message_id)) {
+          this.log.info('[lark] dropped duplicate message event', {
+            event: 'lark_event_deduped',
+            eventId: evt.event_id,
+            messageId: evt.message?.message_id,
+          })
+          return
+        }
+        void this.handleIncomingMessage(evt).catch((err) => {
+          this.log.error('[lark] handleIncomingMessage failed', {
+            event: 'lark_incoming_failed',
+            messageId: evt.message?.message_id,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
+      },
+      // A user reacting to a message (instead of typing). Surface it to the
+      // agent so it can respond. Same fast-ack + dedup discipline.
+      'im.message.reaction.created_v1': (data: unknown) => {
+        const evt = data as LarkReactionEvent
+        if (this.isDuplicateEvent(evt.event_id, `${evt.message_id}:${evt.action_time}`)) return
+        void this.handleReaction(evt).catch((err) => {
+          this.log.error('[lark] handleReaction failed', {
+            event: 'lark_reaction_failed',
+            messageId: evt.message_id,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
       },
       'card.action.trigger': async (data: unknown) => {
         await this.handleCardAction(data as LarkCardActionEvent)
@@ -300,13 +407,27 @@ export class LarkAdapter implements PlatformAdapter {
   }
 
   async destroy(): Promise<void> {
-    // The SDK's WSClient doesn't currently expose a `.stop()` method in its
-    // public types — it tears down on process exit. We null out our refs so
-    // re-init works; the underlying socket gets garbage-collected.
+    // Actively close the long connection. A live WS keeps ping/reconnect timers
+    // running, so it is NOT garbage-collected just by dropping our reference —
+    // leaking it means a re-init leaves the old socket still receiving and
+    // dispatching events, so every event gets processed twice (a duplicate
+    // source independent of redelivery). `WSClient.close({ force })` exists in
+    // the SDK even though an earlier comment here claimed otherwise.
+    try {
+      ;(this.wsClient as unknown as { close?: (p?: { force?: boolean }) => void } | null)?.close?.({
+        force: true,
+      })
+    } catch (err) {
+      this.log.warn('[lark] ws close failed', {
+        event: 'lark_ws_close_failed',
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
     this.wsClient = null
     this.client = null
     this.connected = false
     this.sentMsgTypes.clear()
+    this.seenEventIds.clear()
   }
 
   isConnected(): boolean {
@@ -611,6 +732,10 @@ export class LarkAdapter implements PlatformAdapter {
 
     const senderId =
       sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
+    // 'app' sender = another bot/app. Flag it so access-control can drop bot
+    // traffic (mirrors the Telegram adapter's `senderIsBot`). Without this the
+    // bot can re-ingest app-origin messages and re-run them.
+    const senderIsBot = sender.sender_type === 'app'
 
     // Phase 2: support text + image + file. Other types (audio/video/sticker/etc.)
     // are dropped with an info log so users can see the bot received the event
@@ -624,6 +749,9 @@ export class LarkAdapter implements PlatformAdapter {
         text = ''
       }
       const cleaned = stripMentionPrefix(text)
+      // Instant "received — working on it" feedback via an emoji reaction on the
+      // user's message, instead of a text ack. Best-effort; never for bots.
+      if (!senderIsBot) this.addAckReaction(message.message_id)
       const msg: IncomingMessage = {
         platform: 'lark',
         channelId: message.chat_id,
@@ -632,13 +760,15 @@ export class LarkAdapter implements PlatformAdapter {
         text: cleaned,
         timestamp: parseInt(message.create_time, 10) || Date.now(),
         raw: message,
+        ...(senderIsBot ? { senderIsBot: true } : {}),
       }
       await this.messageHandler(msg)
       return
     }
 
     if (message.message_type === 'image' || message.message_type === 'file') {
-      await this.handleAttachmentMessage(data)
+      if (!senderIsBot) this.addAckReaction(message.message_id)
+      await this.handleAttachmentMessage(data, senderIsBot)
       return
     }
 
@@ -651,7 +781,7 @@ export class LarkAdapter implements PlatformAdapter {
     })
   }
 
-  private async handleAttachmentMessage(data: LarkMessageEvent): Promise<void> {
+  private async handleAttachmentMessage(data: LarkMessageEvent, senderIsBot = false): Promise<void> {
     if (!this.client || !this.messageHandler) return
     const { sender, message } = data
     const senderId =
@@ -704,6 +834,81 @@ export class LarkAdapter implements PlatformAdapter {
       attachments: [incomingAttachment],
       timestamp: parseInt(message.create_time, 10) || Date.now(),
       raw: message,
+      ...(senderIsBot ? { senderIsBot: true } : {}),
+    }
+    await this.messageHandler(msg)
+  }
+
+  /**
+   * Add a lightweight emoji reaction to the user's message as an immediate
+   * "received — working on it" acknowledgement (in place of a text ack).
+   * Best-effort and fire-and-forget: failures (message recalled, missing scope,
+   * etc.) are logged and swallowed so they never block message processing.
+   */
+  private addAckReaction(messageId: string): void {
+    if (!this.client) return
+    this.client.im.messageReaction
+      .create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: ACK_REACTION_EMOJI } } })
+      .catch((err: unknown) => {
+        this.log.warn('[lark] ack reaction failed', {
+          event: 'lark_ack_reaction_failed',
+          messageId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      })
+  }
+
+  /**
+   * Handle an inbound emoji reaction (`im.message.reaction.created_v1`). A user
+   * may "just react" instead of typing — surface it to the agent as a short
+   * synthetic message so it can respond. Our OWN ack reactions (operator_type
+   * 'app') are skipped to avoid an echo loop. The event carries no chat_id, so
+   * we resolve it from the reacted message via `im.message.get`.
+   */
+  private async handleReaction(evt: LarkReactionEvent): Promise<void> {
+    if (!this.client || !this.messageHandler) return
+    if (evt.operator_type === 'app') return // our own ack reaction — ignore
+    const messageId = evt.message_id
+    if (!messageId) return
+
+    const emoji = evt.reaction_type?.emoji_type ?? 'unknown'
+    const senderId =
+      evt.user_id?.user_id ?? evt.user_id?.open_id ?? evt.user_id?.union_id ?? ''
+
+    let chatId: string | undefined
+    try {
+      const res = await this.client.im.message.get({ path: { message_id: messageId } })
+      chatId = res?.data?.items?.[0]?.chat_id
+    } catch (err) {
+      this.log.warn('[lark] reaction: message.get failed', {
+        event: 'lark_reaction_get_failed',
+        messageId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    if (!chatId) {
+      this.log.warn('[lark] reaction: could not resolve chat; dropping', {
+        event: 'lark_reaction_no_chat',
+        messageId,
+      })
+      return
+    }
+
+    this.log.info('[lark] reaction received', {
+      event: 'lark_reaction_received',
+      messageId,
+      emoji,
+      chatId,
+    })
+
+    const msg: IncomingMessage = {
+      platform: 'lark',
+      channelId: chatId,
+      messageId,
+      senderId,
+      text: `[The user reacted with the :${emoji}: emoji to an earlier message (id ${messageId}) instead of writing a reply. Interpret the reaction in context and respond if a response is warranted.]`,
+      timestamp: Number(evt.action_time) || Date.now(),
+      raw: evt,
     }
     await this.messageHandler(msg)
   }
