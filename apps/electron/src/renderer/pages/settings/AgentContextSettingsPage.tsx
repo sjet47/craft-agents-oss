@@ -41,6 +41,7 @@ interface AgentContextFormState {
   globalPath: string
   projectEnabled: boolean
   projectPath: string
+  skillsEnabled: boolean
 }
 
 const defaultFormState: AgentContextFormState = {
@@ -48,6 +49,7 @@ const defaultFormState: AgentContextFormState = {
   globalPath: DEFAULT_AGENT_CONTEXT_GLOBAL_PATH,
   projectEnabled: true,
   projectPath: DEFAULT_AGENT_CONTEXT_PROJECT_PATH,
+  skillsEnabled: true,
 }
 
 // Parse preferences JSON into form state, applying default-on semantics:
@@ -61,6 +63,7 @@ function parseAgentContext(json: string): AgentContextFormState {
       globalPath: prefs.agentContextGlobalPath || DEFAULT_AGENT_CONTEXT_GLOBAL_PATH,
       projectEnabled: prefs.agentContextProjectEnabled !== false,
       projectPath: prefs.agentContextProjectPath || DEFAULT_AGENT_CONTEXT_PROJECT_PATH,
+      skillsEnabled: prefs.agentContextSkillsEnabled !== false,
     }
   } catch {
     return defaultFormState
@@ -82,6 +85,7 @@ function serializeAgentContext(json: string, state: AgentContextFormState): stri
   prefs.agentContextGlobalPath = state.globalPath
   prefs.agentContextProjectEnabled = state.projectEnabled
   prefs.agentContextProjectPath = state.projectPath
+  prefs.agentContextSkillsEnabled = state.skillsEnabled
   prefs.updatedAt = Date.now()
 
   return JSON.stringify(prefs, null, 2)
@@ -237,6 +241,21 @@ export default function AgentContextSettingsPage() {
                   onChange={(v) => updateField('projectPath', v)}
                   placeholder={DEFAULT_AGENT_CONTEXT_PROJECT_PATH}
                   inCard
+                />
+              </SettingsCard>
+            </SettingsSection>
+
+            {/* Skills catalog */}
+            <SettingsSection
+              title={t("settings.agentContext.skills")}
+              description={t("settings.agentContext.skillsDesc")}
+            >
+              <SettingsCard>
+                <SettingsToggle
+                  label={t("settings.agentContext.skillsToggle")}
+                  description={t("settings.agentContext.skillsToggleDesc")}
+                  checked={formState.skillsEnabled}
+                  onCheckedChange={(v) => updateField('skillsEnabled', v)}
                 />
               </SettingsCard>
             </SettingsSection>

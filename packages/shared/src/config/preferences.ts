@@ -52,6 +52,12 @@ export interface UserPreferences {
   /** Path to the project agent context file (relative to working directory) */
   agentContextProjectPath?: string;
   /**
+   * Whether the catalog of installed skills (name + slug + description) is
+   * injected into the system prompt so the model can discover them without the
+   * user typing `[skill:slug]` first (default: true).
+   */
+  agentContextSkillsEnabled?: boolean;
+  /**
    * Internal: persisted UI language code (mirrors Appearance → Language).
    * Maintained only by the main-process `i18n:changeLanguage` IPC handler.
    * Not user-editable; not exposed via the `update_user_preferences` tool.

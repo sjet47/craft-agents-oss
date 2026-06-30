@@ -15,6 +15,8 @@ import { PERMISSION_MODE_CONFIG } from '../agent/mode-types.ts';
 import { FEATURE_FLAGS } from '../feature-flags.ts';
 import { APP_VERSION } from '../version/index.ts';
 import { readPluginName } from '../utils/workspace.ts';
+import { loadAllSkills } from '../skills/index.ts';
+import type { LoadedSkill } from '../skills/index.ts';
 import { globSync } from 'glob';
 import os from 'os';
 
@@ -282,6 +284,46 @@ ${content}
 }
 
 /**
+ * Build the available-skills injection block for the system prompt.
+ *
+ * Lists every installed skill (name + slug + description from SKILL.md
+ * frontmatter) so the model can DISCOVER which skills exist without the user
+ * typing `[skill:slug]` first. Craft otherwise only documents the invocation
+ * mechanism — it never tells the model WHICH skills are installed — so a
+ * relevant skill stays invisible until explicitly named. Default-on; only an
+ * explicit `false` disables it. Returns '' when disabled, when there is no
+ * workspace, or when no skills are installed.
+ *
+ * Only the one-line catalog is injected, not skill CONTENT: skills can be large
+ * and the "## Skills" section already mandates reading SKILL.md before
+ * execution. Skill loading is cached (see loadAllSkills).
+ */
+export function getAvailableSkillsPrompt(workspaceRoot?: string, workingDirectory?: string): string {
+  if (!workspaceRoot) return '';
+  const prefs = loadPreferences();
+  if (prefs.agentContextSkillsEnabled === false) return '';
+
+  let skills: LoadedSkill[];
+  try {
+    skills = loadAllSkills(workspaceRoot, workingDirectory);
+  } catch {
+    return '';
+  }
+  if (skills.length === 0) return '';
+
+  const lines = skills.map((s) => {
+    const name = s.metadata.name?.trim() || s.slug;
+    const desc = s.metadata.description?.trim();
+    return `- \`[skill:${s.slug}]\` ${name}${desc ? ` — ${desc}` : ''}`;
+  });
+
+  return `\nThe following skills are installed and available. When a request matches one, use it proactively — read its \`SKILL.md\` (resolve the path per the Skills section) and follow it; the user does not need to type \`[skill:slug]\` first.
+<available_skills>
+${lines.join('\n')}
+</available_skills>`;
+}
+
+/**
  * Get the working directory context string for injection into user messages.
  * Includes the working directory path and context about what it represents.
  * Returns empty string if no working directory is set.
@@ -482,6 +524,11 @@ export function getSystemPrompt(
   // nested context-file listing below.
   const agentContext = getAgentContextPrompt(workingDirectory);
 
+  // Catalog installed skills (name + slug + description) so the model can
+  // discover and use them without the user naming them (default-on; see
+  // getAvailableSkillsPrompt).
+  const availableSkills = getAvailableSkillsPrompt(workspaceRootPath, workingDirectory);
+
   // Get project context files for monorepo support (lives in system prompt for persistence across compaction)
   const projectContextFiles = getProjectContextFilesPrompt(workingDirectory);
 
@@ -493,7 +540,7 @@ export function getSystemPrompt(
   // to enable prompt caching. The system prompt stays static and cacheable.
   // Safe Mode context is also in user messages for the same reason.
   const basePrompt = getCraftAssistantPrompt(workspaceRootPath, backendName, resolvedIncludeCoAuthoredBy);
-  const fullPrompt = `${basePrompt}${preferences}${debugContext}${agentContext}${projectContextFiles}`;
+  const fullPrompt = `${basePrompt}${preferences}${debugContext}${agentContext}${availableSkills}${projectContextFiles}`;
 
   debug('[getSystemPrompt] full prompt length:', fullPrompt.length);
 
@@ -680,6 +727,8 @@ Skills are stored at three levels (checked in order):
 - Global: \`~/.agents/skills/{slug}/SKILL.md\`
 - Workspace: \`${workspacePath}/skills/{slug}/SKILL.md\`
 - Project: \`{projectRoot}/.agents/skills/{slug}/SKILL.md\`
+
+When \`<available_skills>\` appears below, it catalogs the skills currently installed (name, \`[skill:slug]\`, description). Consult it to pick a relevant skill proactively — you may invoke one even if the user did not name it — then read that skill's \`SKILL.md\` before acting.
 
 ## Project Context
 
