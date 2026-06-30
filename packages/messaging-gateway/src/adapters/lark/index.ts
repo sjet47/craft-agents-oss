@@ -471,7 +471,10 @@ export class LarkAdapter implements PlatformAdapter {
     const { msgType, content } =
       formatted.kind === 'text'
         ? { msgType: 'text' as const, content: JSON.stringify({ text: formatted.text }) }
-        : { msgType: 'post' as const, content: JSON.stringify(formatted.post) }
+        : // The OpenAPI `post` content is the locale object itself —
+          // `{"en_us":{"content":[…]}}` — NOT wrapped in an extra `post` key.
+          // `LarkPost` nests it under `.post`, so serialize the inner object.
+          { msgType: 'post' as const, content: JSON.stringify(formatted.post.post) }
 
     const result = await this.client.im.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -517,7 +520,8 @@ export class LarkAdapter implements PlatformAdapter {
       // a trivial post so the msg_type still matches the original.
       const formatted = formatForLarkPost(text)
       const post: LarkPost = formatted.kind === 'post' ? formatted.post : wrapAsTrivialPost(text)
-      content = JSON.stringify(post)
+      // Wire content is the inner locale object, not the `.post`-wrapped shape.
+      content = JSON.stringify(post.post)
       msgType = 'post'
     } else {
       content = JSON.stringify({ text })

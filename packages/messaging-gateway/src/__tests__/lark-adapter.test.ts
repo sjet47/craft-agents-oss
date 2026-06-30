@@ -87,18 +87,24 @@ interface FakeCalls {
   reactions: Array<{ path: { message_id: string }; data: { reaction_type: { emoji_type: string } } }>
   deletes: Array<{ message_id: string; reaction_id: string }>
   gets: string[]
+  sends: Array<{ msg_type: string; content: string }>
 }
 
 function makeAdapterWithFakeClient() {
   const adapter = new LarkAdapter()
-  const calls: FakeCalls = { reactions: [], deletes: [], gets: [] }
+  const calls: FakeCalls = { reactions: [], deletes: [], gets: [], sends: [] }
   let reactionSeq = 0
+  let sendSeq = 0
   const fakeClient = {
     im: {
       message: {
         get: async ({ path }: { path: { message_id: string } }) => {
           calls.gets.push(path.message_id)
           return { data: { items: [{ chat_id: 'oc_resolved' }] } }
+        },
+        create: async ({ data }: { data: { msg_type: string; content: string } }) => {
+          calls.sends.push({ msg_type: data.msg_type, content: data.content })
+          return { data: { message_id: `om_sent_${++sendSeq}` } }
         },
       },
       messageReaction: {
@@ -182,6 +188,28 @@ describe('LarkAdapter — inbound message handling', () => {
     expect(received[0]!.senderIsBot).toBe(true)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((adapter as any).lastUserMessageId.get('oc_1')).toBeUndefined()
+  })
+})
+
+describe('LarkAdapter — post wire format', () => {
+  it('sends markdown as a post whose content is the locale object (no extra "post" wrapper)', async () => {
+    const { adapter, calls } = makeAdapterWithFakeClient()
+    await adapter.sendText('oc_1', 'Here is **bold** text')
+    expect(calls.sends).toHaveLength(1)
+    expect(calls.sends[0]!.msg_type).toBe('post')
+    const parsed = JSON.parse(calls.sends[0]!.content)
+    // Feishu OpenAPI expects top-level locale keys, NOT a top-level "post" key.
+    expect(parsed.post).toBeUndefined()
+    expect(parsed.en_us).toBeDefined()
+    expect(Array.isArray(parsed.en_us.content)).toBe(true)
+  })
+
+  it('sends plain text as a text message', async () => {
+    const { adapter, calls } = makeAdapterWithFakeClient()
+    await adapter.sendText('oc_1', 'just plain text')
+    expect(calls.sends).toHaveLength(1)
+    expect(calls.sends[0]!.msg_type).toBe('text')
+    expect(JSON.parse(calls.sends[0]!.content)).toEqual({ text: 'just plain text' })
   })
 })
 
