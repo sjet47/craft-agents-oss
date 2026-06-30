@@ -72,6 +72,13 @@ export interface AdapterCapabilities {
   maxMessageLength: number
   markdown: 'v2' | 'whatsapp' | 'lark-post'
   webhookSupport: boolean
+  /**
+   * When true, the renderer signals the "working" phase via an emoji reaction
+   * on the user's message (`showThinking`/`clearThinking`) instead of posting a
+   * "💭 thinking…" text bubble. The platform must support message reactions
+   * (currently Lark). Defaults to false/undefined.
+   */
+  thinkingReaction?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +232,23 @@ export interface PlatformAdapter {
 
   /** Webhook handler for headless server (Telegram only). */
   handleWebhook?(request: Request): Promise<Response>
+
+  /**
+   * Show a transient "working on it" indicator as an emoji reaction on the
+   * channel's most recent user message, in place of a text bubble. Driven by
+   * the renderer at the start of the working phase; idempotent (calling it
+   * again while already shown is a no-op). Implemented only by adapters with
+   * `capabilities.thinkingReaction` (Lark); the add/remove is fully internal to
+   * the channel and invisible to the agent. Best-effort: never throws.
+   */
+  showThinking?(channelId: string, opts?: SendOptions): Promise<void>
+
+  /**
+   * Remove the reaction added by {@link showThinking}. Driven by the renderer
+   * when the working phase ends (run complete, error, or while paused on a
+   * permission prompt). No-op if nothing is currently shown. Best-effort.
+   */
+  clearThinking?(channelId: string, opts?: SendOptions): Promise<void>
 }
 
 // ---------------------------------------------------------------------------

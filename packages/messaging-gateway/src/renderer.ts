@@ -52,6 +52,16 @@ export interface SessionEvent {
   [key: string]: unknown
 }
 
+/**
+ * True when the adapter signals the working phase via an emoji reaction on the
+ * user's message (Lark) instead of a "💭 thinking…" text bubble. When true the
+ * renderer drives `showThinking`/`clearThinking` and suppresses the status
+ * bubble; the final answer still posts as a normal message.
+ */
+function adapterSupportsThinkingReaction(adapter: PlatformAdapter): boolean {
+  return adapter.capabilities.thinkingReaction === true && typeof adapter.showThinking === 'function'
+}
+
 /** PermissionRequest shape from @craft-agent/core. */
 interface PermissionRequest {
   requestId: string
@@ -355,7 +365,7 @@ export class Renderer {
         }
         // Intermediate text is dropped from the bubble. Make sure it exists and shows
         // thinking status so the user knows the run is alive.
-        await this.ensureProgressBubble(state, binding, adapter, THINKING_LABEL)
+        await this.progressWorking(state, binding, adapter, THINKING_LABEL)
         return
       }
 
@@ -365,7 +375,7 @@ export class Renderer {
           typeof event.toolDisplayName === 'string' && event.toolDisplayName.length > 0
             ? event.toolDisplayName
             : toolName
-        await this.ensureProgressBubble(state, binding, adapter, `🔧 ${displayName}…`)
+        await this.progressWorking(state, binding, adapter, `🔧 ${displayName}…`)
         return
       }
 
@@ -373,12 +383,17 @@ export class Renderer {
         // Tool finished — revert the indicator to thinking until the next
         // tool_start or text_complete. Skip if we haven't posted yet (unlikely).
         if (state.progressMessageId) {
-          await this.ensureProgressBubble(state, binding, adapter, THINKING_LABEL)
+          await this.progressWorking(state, binding, adapter, THINKING_LABEL)
         }
         return
       }
 
       case 'complete': {
+        // Working phase over — drop the reaction indicator (Lark) before the
+        // final answer is posted as its own message.
+        if (adapterSupportsThinkingReaction(adapter)) {
+          await adapter.clearThinking?.(binding.channelId, bindingOpts(binding))
+        }
         // Prefer the clean non-intermediate final; fall back to the last
         // assistant text so a tool-terminated run still delivers a message
         // instead of freezing the bubble on "thinking…".
@@ -404,6 +419,26 @@ export class Renderer {
         return
       }
     }
+  }
+
+  /**
+   * Signal the "working" phase. On adapters with `thinkingReaction` (Lark) this
+   * adds/keeps an emoji reaction on the user's message and posts NO status
+   * bubble; elsewhere it falls back to the evolving "💭 thinking…"/"🔧 tool…"
+   * text bubble. `showThinking` is idempotent, so calling this on every
+   * intermediate event is safe.
+   */
+  private async progressWorking(
+    state: RenderState,
+    binding: ChannelBinding,
+    adapter: PlatformAdapter,
+    label: string,
+  ): Promise<void> {
+    if (adapterSupportsThinkingReaction(adapter)) {
+      await adapter.showThinking?.(binding.channelId, bindingOpts(binding))
+      return
+    }
+    await this.ensureProgressBubble(state, binding, adapter, label)
   }
 
   /**
@@ -488,6 +523,13 @@ export class Renderer {
   ): Promise<void> {
     const request = event.request as PermissionRequest | undefined
     if (!request?.requestId) return
+
+    // The run is paused waiting on the user — drop the "working" reaction so a
+    // 💡 doesn't linger as if the agent were still thinking. It re-appears when
+    // the run resumes and emits its next event.
+    if (adapterSupportsThinkingReaction(adapter)) {
+      await adapter.clearThinking?.(binding.channelId, bindingOpts(binding))
+    }
 
     // Flush any streaming state first so the prompt lands as a distinct
     // message (progress-mode bubble stays in place as a separate message).
@@ -630,6 +672,9 @@ Approve in the desktop app to continue.`,
   ): Promise<void> {
     const errorMsg = extractErrorMessage(event.error)
     this.cancelEditTimer(state)
+    if (adapterSupportsThinkingReaction(adapter)) {
+      await adapter.clearThinking?.(binding.channelId, bindingOpts(binding))
+    }
     await adapter.sendText(binding.channelId, `❌ ${errorMsg}`, bindingOpts(binding))
     this.resetRun(state)
   }

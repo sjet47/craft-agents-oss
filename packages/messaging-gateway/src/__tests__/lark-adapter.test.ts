@@ -85,12 +85,14 @@ describe('LarkAdapter — static contract', () => {
 
 interface FakeCalls {
   reactions: Array<{ path: { message_id: string }; data: { reaction_type: { emoji_type: string } } }>
+  deletes: Array<{ message_id: string; reaction_id: string }>
   gets: string[]
 }
 
 function makeAdapterWithFakeClient() {
   const adapter = new LarkAdapter()
-  const calls: FakeCalls = { reactions: [], gets: [] }
+  const calls: FakeCalls = { reactions: [], deletes: [], gets: [] }
+  let reactionSeq = 0
   const fakeClient = {
     im: {
       message: {
@@ -102,9 +104,12 @@ function makeAdapterWithFakeClient() {
       messageReaction: {
         create: async (args: FakeCalls['reactions'][number]) => {
           calls.reactions.push(args)
-          return { data: { reaction_id: 'r1' } }
+          return { data: { reaction_id: `r${++reactionSeq}` } }
         },
-        delete: async () => ({}),
+        delete: async ({ path }: { path: { message_id: string; reaction_id: string } }) => {
+          calls.deletes.push({ message_id: path.message_id, reaction_id: path.reaction_id })
+          return {}
+        },
       },
     },
   }
@@ -154,27 +159,71 @@ describe('LarkAdapter — event dedup (isDuplicateEvent)', () => {
 })
 
 describe('LarkAdapter — inbound message handling', () => {
-  it('routes a user text message, flags no bot, and adds the emoji ack', async () => {
+  it('routes a user text message, flags no bot, and records it for thinking reactions', async () => {
     const { adapter, calls, received } = makeAdapterWithFakeClient()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (adapter as any).handleIncomingMessage(textEvent())
     expect(received).toHaveLength(1)
     expect(received[0]!.text).toBe('hello')
     expect(received[0]!.senderIsBot).toBeUndefined()
-    expect(calls.reactions).toHaveLength(1)
-    expect(calls.reactions[0]!.path.message_id).toBe('om_1')
-    expect(calls.reactions[0]!.data.reaction_type.emoji_type).toBe('StatusFlashOfInspiration')
+    // No reaction on receive — the renderer drives showThinking when the run starts.
+    expect(calls.reactions).toHaveLength(0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((adapter as any).lastUserMessageId.get('oc_1')).toBe('om_1')
   })
 
-  it('flags app-sender messages as bot and skips the ack reaction', async () => {
-    const { adapter, calls, received } = makeAdapterWithFakeClient()
+  it('flags app-sender messages as bot and does not record them as a user message', async () => {
+    const { adapter, received } = makeAdapterWithFakeClient()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (adapter as any).handleIncomingMessage(
       textEvent({ sender: { sender_id: { open_id: 'ou_bot' }, sender_type: 'app' } }),
     )
     expect(received).toHaveLength(1)
     expect(received[0]!.senderIsBot).toBe(true)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((adapter as any).lastUserMessageId.get('oc_1')).toBeUndefined()
+  })
+})
+
+describe('LarkAdapter — thinking reaction lifecycle', () => {
+  it('advertises the thinkingReaction capability', () => {
+    expect(new LarkAdapter().capabilities.thinkingReaction).toBe(true)
+  })
+
+  it('showThinking reacts to the channel\'s last user message; clearThinking removes it', async () => {
+    const { adapter, calls } = makeAdapterWithFakeClient()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (adapter as any).handleIncomingMessage(textEvent())
+
+    await adapter.showThinking!('oc_1')
+    expect(calls.reactions).toHaveLength(1)
+    expect(calls.reactions[0]!.path.message_id).toBe('om_1')
+    expect(calls.reactions[0]!.data.reaction_type.emoji_type).toBe('StatusFlashOfInspiration')
+
+    // Idempotent: a second showThinking while already shown does nothing.
+    await adapter.showThinking!('oc_1')
+    expect(calls.reactions).toHaveLength(1)
+
+    await adapter.clearThinking!('oc_1')
+    expect(calls.deletes).toHaveLength(1)
+    expect(calls.deletes[0]!.message_id).toBe('om_1')
+    expect(calls.deletes[0]!.reaction_id).toBe('r1')
+
+    // After clearing, showThinking can add a fresh reaction again.
+    await adapter.showThinking!('oc_1')
+    expect(calls.reactions).toHaveLength(2)
+  })
+
+  it('showThinking is a no-op when the channel has no known user message', async () => {
+    const { adapter, calls } = makeAdapterWithFakeClient()
+    await adapter.showThinking!('oc_unknown')
     expect(calls.reactions).toHaveLength(0)
+  })
+
+  it('clearThinking is a no-op when nothing is shown', async () => {
+    const { adapter, calls } = makeAdapterWithFakeClient()
+    await adapter.clearThinking!('oc_1')
+    expect(calls.deletes).toHaveLength(0)
   })
 })
 

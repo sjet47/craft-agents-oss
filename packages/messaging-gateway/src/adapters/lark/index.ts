@@ -248,6 +248,9 @@ export class LarkAdapter implements PlatformAdapter {
     maxMessageLength: 30000,
     markdown: 'lark-post',
     webhookSupport: false,
+    // Use an emoji reaction (💡) on the user's message as the "working" status,
+    // in place of a "💭 thinking…" text bubble. See showThinking/clearThinking.
+    thinkingReaction: true,
   }
 
   private client: LarkClient | null = null
@@ -271,6 +274,20 @@ export class LarkAdapter implements PlatformAdapter {
    * insertion timestamps; stale entries are evicted opportunistically.
    */
   private seenEventIds = new Map<string, number>()
+
+  /**
+   * Most recent inbound user message id per channel. The renderer's
+   * `showThinking(channelId)` reacts to this — the renderer only knows the
+   * channel, while the adapter is what actually saw the message id.
+   */
+  private lastUserMessageId = new Map<string, string>()
+
+  /**
+   * In-flight "thinking" reaction per channel. `create` resolves to the
+   * reaction_id (or null on failure) so `clearThinking` can delete exactly the
+   * reaction it added, even if the create is still in flight when we clear.
+   */
+  private thinkingReactions = new Map<string, { messageId: string; create: Promise<string | null> }>()
 
   /**
    * True if this event was already seen within the TTL (i.e. a redelivery).
@@ -428,6 +445,8 @@ export class LarkAdapter implements PlatformAdapter {
     this.connected = false
     this.sentMsgTypes.clear()
     this.seenEventIds.clear()
+    this.lastUserMessageId.clear()
+    this.thinkingReactions.clear()
   }
 
   isConnected(): boolean {
@@ -736,6 +755,9 @@ export class LarkAdapter implements PlatformAdapter {
     // traffic (mirrors the Telegram adapter's `senderIsBot`). Without this the
     // bot can re-ingest app-origin messages and re-run them.
     const senderIsBot = sender.sender_type === 'app'
+    // Remember the latest real user message per channel so the renderer-driven
+    // `showThinking(channelId)` knows which message to react to.
+    if (!senderIsBot) this.lastUserMessageId.set(message.chat_id, message.message_id)
 
     // Phase 2: support text + image + file. Other types (audio/video/sticker/etc.)
     // are dropped with an info log so users can see the bot received the event
@@ -749,9 +771,6 @@ export class LarkAdapter implements PlatformAdapter {
         text = ''
       }
       const cleaned = stripMentionPrefix(text)
-      // Instant "received — working on it" feedback via an emoji reaction on the
-      // user's message, instead of a text ack. Best-effort; never for bots.
-      if (!senderIsBot) this.addAckReaction(message.message_id)
       const msg: IncomingMessage = {
         platform: 'lark',
         channelId: message.chat_id,
@@ -767,7 +786,6 @@ export class LarkAdapter implements PlatformAdapter {
     }
 
     if (message.message_type === 'image' || message.message_type === 'file') {
-      if (!senderIsBot) this.addAckReaction(message.message_id)
       await this.handleAttachmentMessage(data, senderIsBot)
       return
     }
@@ -840,22 +858,58 @@ export class LarkAdapter implements PlatformAdapter {
   }
 
   /**
-   * Add a lightweight emoji reaction to the user's message as an immediate
-   * "received — working on it" acknowledgement (in place of a text ack).
-   * Best-effort and fire-and-forget: failures (message recalled, missing scope,
-   * etc.) are logged and swallowed so they never block message processing.
+   * Show the "working on it" indicator: add an emoji reaction to the channel's
+   * most recent user message. Driven by the renderer at the start of the
+   * working phase, in place of a text bubble. Idempotent per channel (a second
+   * call while already shown is a no-op) and best-effort — failures (message
+   * recalled, missing scope, etc.) are logged and swallowed, never thrown.
    */
-  private addAckReaction(messageId: string): void {
+  async showThinking(channelId: string): Promise<void> {
     if (!this.client) return
-    this.client.im.messageReaction
-      .create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: ACK_REACTION_EMOJI } } })
+    if (this.thinkingReactions.has(channelId)) return // already showing
+    const messageId = this.lastUserMessageId.get(channelId)
+    if (!messageId) return
+    const client = this.client
+    const create = client.im.messageReaction
+      .create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: ACK_REACTION_EMOJI } },
+      })
+      .then((r) => r?.data?.reaction_id ?? null)
       .catch((err: unknown) => {
-        this.log.warn('[lark] ack reaction failed', {
-          event: 'lark_ack_reaction_failed',
+        this.log.warn('[lark] show thinking reaction failed', {
+          event: 'lark_thinking_add_failed',
           messageId,
           error: err instanceof Error ? err.message : String(err),
         })
+        return null
       })
+    this.thinkingReactions.set(channelId, { messageId, create })
+  }
+
+  /**
+   * Clear the "working on it" indicator added by {@link showThinking}. Driven by
+   * the renderer when the working phase ends. Awaits the (possibly still
+   * in-flight) create so it deletes exactly the reaction it added. No-op if
+   * nothing is shown; best-effort on delete.
+   */
+  async clearThinking(channelId: string): Promise<void> {
+    const entry = this.thinkingReactions.get(channelId)
+    if (!entry) return
+    this.thinkingReactions.delete(channelId)
+    const reactionId = await entry.create
+    if (!reactionId || !this.client) return
+    try {
+      await this.client.im.messageReaction.delete({
+        path: { message_id: entry.messageId, reaction_id: reactionId },
+      })
+    } catch (err) {
+      this.log.warn('[lark] clear thinking reaction failed', {
+        event: 'lark_thinking_clear_failed',
+        messageId: entry.messageId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   /**
