@@ -314,10 +314,11 @@ export function getAvailableSkillsPrompt(workspaceRoot?: string, workingDirector
   const lines = skills.map((s) => {
     const name = s.metadata.name?.trim() || s.slug;
     const desc = s.metadata.description?.trim();
-    return `- \`[skill:${s.slug}]\` ${name}${desc ? ` — ${desc}` : ''}`;
+    const skillMdPath = join(s.path, 'SKILL.md');
+    return `- \`[skill:${s.slug}]\` ${name}${desc ? ` — ${desc}` : ''}\n  ${skillMdPath}`;
   });
 
-  return `\nThe following skills are installed and available. When a request matches one, use it proactively — read its \`SKILL.md\` (resolve the path per the Skills section) and follow it; the user does not need to type \`[skill:slug]\` first.
+  return `\nThe following skills are installed and available. When a request matches one, use it proactively — read its \`SKILL.md\` at the path listed under it and follow it; the user does not need to type \`[skill:slug]\` first.
 <available_skills>
 ${lines.join('\n')}
 </available_skills>`;
@@ -728,7 +729,7 @@ Skills are stored at three levels (checked in order):
 - Workspace: \`${workspacePath}/skills/{slug}/SKILL.md\`
 - Project: \`{projectRoot}/.agents/skills/{slug}/SKILL.md\`
 
-When \`<available_skills>\` appears below, it catalogs the skills currently installed (name, \`[skill:slug]\`, description). Consult it to pick a relevant skill proactively — you may invoke one even if the user did not name it — then read that skill's \`SKILL.md\` before acting.
+When \`<available_skills>\` appears below, it catalogs the skills currently installed (name, \`[skill:slug]\`, description, and the absolute path to its \`SKILL.md\`). Consult it to pick a relevant skill proactively — you may invoke one even if the user did not name it — then read that skill's \`SKILL.md\` at the listed path before acting; do not probe the storage levels above when the path is given.
 
 ## Project Context
 
